@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+
+# Scan output
+*-subdomains-*.txt
+*-subdomains-*.json
