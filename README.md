@@ -16,6 +16,7 @@ sub_passive.py example.com` works on a clean machine.
   `gau`, `waybackurls`) used automatically when present
 * Concurrent execution, with retries and backoff on rate limits and outages
 * Results normalized, scope-filtered and deduplicated
+* Interactive source picker (`-i`), for choosing sources without listing names
 * Per-source statistics, so you can see which sources actually contribute
 * Text and JSON output, plus new-asset detection between runs
 * Pipe-friendly: hostnames on stdout, progress on stderr
@@ -153,7 +154,7 @@ report a connection error rather than silently going direct.
 
 ```bash
 python3 sub_passive.py [-h] [-o OUTPUT_DIR] [-t SOURCE ...] [-x SOURCE ...]
-                       [--all] [--json] [--stats] [--silent] [--threads N]
+                       [-i] [--all] [--json] [--stats] [--silent] [--threads N]
                        [--timeout SECONDS] [--known FILE ...] [--only-new]
                        [--list-sources] domain [domain ...]
 ```
@@ -166,6 +167,7 @@ python3 sub_passive.py [-h] [-o OUTPUT_DIR] [-t SOURCE ...] [-x SOURCE ...]
 | `-o, --output-dir` | Output directory (default: current directory)       |
 | `-t, --tools`      | One or more sources to use                          |
 | `-x, --exclude`    | One or more sources to skip                         |
+| `-i, --interactive`| Pick sources from a checkbox list before scanning    |
 | `--all`            | Also query slow and unreliable sources              |
 | `--json`           | Also write a JSON report                            |
 | `--stats`          | Print a per-source contribution table               |
@@ -197,6 +199,44 @@ python3 sub_passive.py example.com -t crtsh certspotter subfinder
 ```bash
 python3 sub_passive.py example.com -x wayback commoncrawl
 ```
+
+### Choose sources interactively
+
+```bash
+python3 sub_passive.py example.com -i
+```
+
+Opens a checkbox list of every source, showing which are ready to run here and
+which are skipped for want of a key or a binary:
+
+```
+  sub-passive · select sources                          7 selected · 7 ready here
+
+> [x] crtsh            none            ready   certificate transparency logs (crt.sh)
+  [x] certspotter      none            ready   SSLMate CertSpotter CT issuances
+  [ ] commoncrawl      none            ready   Common Crawl URL index  [off by default]
+  [ ] virustotal       virustotal      skip    VirusTotal  (no SUB_PASSIVE_VIRUSTOTAL_KEY)
+  [ ] subfinder        binary          skip    subfinder, if installed  (not installed)
+
+  ↑↓ move  ·  space toggle  ·  a all  ·  n none  ·  d defaults  ·  r ready  ·  / filter  ·  enter run  ·  q quit
+```
+
+| Key            | Action                                                  |
+| -------------- | ------------------------------------------------------- |
+| `↑` `↓` `k` `j`| Move (also `PgUp`/`PgDn`, `g`/`G` for top and bottom)    |
+| `space` `x`    | Toggle the source under the cursor                       |
+| `a` / `n`      | Select / clear everything currently shown                |
+| `d`            | Back to the default selection                            |
+| `r`            | Add every source that can actually run here              |
+| `/`            | Filter by name, provider or description (`esc` clears)   |
+| `enter`        | Run the selection                                        |
+| `q` `esc`      | Quit without scanning                                    |
+
+The list starts from whatever `-t`, `-x` and `--all` already selected, so
+`-i --all` opens with the opt-in sources ticked. The picker draws on `/dev/tty`,
+which leaves stdout free for hostnames — `python3 sub_passive.py example.com -i
+--silent | httpx` works. Terminals that cannot be driven that way (`TERM=dumb`,
+Windows) get a numbered prompt instead, where you toggle by typing `3` or `5-8`.
 
 ### Save output to a directory, with a JSON report and source stats
 

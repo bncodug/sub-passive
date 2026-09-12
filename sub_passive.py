@@ -1116,6 +1116,429 @@ def list_sources() -> None:
           "%d ready to run here." % (len(SOURCES), len(keyless), len(ready)))
 
 
+# ==========================
+# Interactive Selection
+# ==========================
+#
+# --interactive opens a checkbox list over the registry, so sources can be
+# picked by hand instead of spelled out with -t/-x. It reads and draws on
+# /dev/tty rather than the standard streams, which keeps the picker usable
+# while hostnames are being piped somewhere and progress is going to stderr.
+
+
+class NoTerminal(Exception):
+    """Raised when there is no terminal the picker can drive."""
+
+
+_KEYS = {
+    "\x1b[A": "up", "\x1b[B": "down", "\x1b[C": "right", "\x1b[D": "left",
+    "\x1bOA": "up", "\x1bOB": "down", "\x1bOC": "right", "\x1bOD": "left",
+    "\x1b[5~": "pgup", "\x1b[6~": "pgdn",
+    "\x1b[H": "home", "\x1b[F": "end", "\x1bOH": "home", "\x1bOF": "end",
+    "\x1b[1~": "home", "\x1b[4~": "end", "\x1b[7~": "home", "\x1b[8~": "end",
+}
+
+_CONTROL_KEYS = {
+    "\r": "enter", "\n": "enter", "\x7f": "backspace", "\b": "backspace",
+    "\x03": "ctrl-c", "\x04": "eof", "\x15": "clear",
+}
+
+
+def _utf8_length(first: int) -> int:
+    """Total byte length of the UTF-8 character starting with this byte."""
+    if first >= 0xF0:
+        return 4
+    if first >= 0xE0:
+        return 3
+    if first >= 0xC0:
+        return 2
+    return 1
+
+
+def _input_waiting(stream, timeout: float) -> bool:
+    import select
+    try:
+        return bool(select.select([stream], [], [], timeout)[0])
+    except (OSError, ValueError):
+        # Not a selectable stream (a test double, say): assume the rest of the
+        # sequence is already buffered and let the read decide.
+        return True
+
+
+def read_key(stream, waiter: Optional[Callable[[object, float], bool]] = None) -> str:
+    """Block for one keypress on a raw-mode byte stream and name it.
+
+    Returns a name for the keys the picker binds ("up", "enter", "esc", ...)
+    and the character itself for anything printable.
+    """
+    waiter = waiter or _input_waiting
+    first = stream.read(1)
+    if not first:
+        return "eof"
+
+    if first != b"\x1b":
+        extra = _utf8_length(first[0]) - 1
+        raw = first + (stream.read(extra) if extra else b"")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return "unknown"
+        return _CONTROL_KEYS.get(text, text)
+
+    # Escape alone means "quit"; escape followed immediately by more bytes is
+    # an arrow or navigation key, so wait briefly for the rest of it.
+    sequence = first
+    while len(sequence) < 8 and waiter(stream, 0.05):
+        nxt = stream.read(1)
+        if not nxt:
+            break
+        sequence += nxt
+        if sequence.decode("latin-1") in _KEYS:
+            break
+    text = sequence.decode("latin-1")
+    if text in _KEYS:
+        return _KEYS[text]
+    return "esc" if text == "\x1b" else "unknown"
+
+
+class SourcePicker:
+    """Keyboard-driven checkbox list over the source registry.
+
+    Deliberately a pure state machine: handle_key() updates the selection and
+    render() returns the lines to draw. run_picker() supplies the keystrokes
+    and paints the result, so everything here is testable without a terminal.
+    """
+
+    HELP = ("↑↓ move  ·  space toggle  ·  a all  ·  n none  ·  d defaults  ·  "
+            "r ready  ·  / filter  ·  enter run  ·  q quit")
+
+    def __init__(self, sources: Sequence[Source], selected: Sequence[str],
+                 reasons: Optional[Dict[str, str]] = None, color: bool = False):
+        self.sources = list(sources)
+        self.selected = set(selected)
+        # Looked up once: skip_reason() shells out to shutil.which().
+        self.reasons = dict(reasons) if reasons is not None else {
+            source.name: skip_reason(source) for source in self.sources}
+        self.color = color
+        self.cursor = 0
+        self.offset = 0
+        self.query = ""
+        self.filtering = False
+        self.status = ""
+
+    # -- state ------------------------------------------------------------
+
+    def visible(self) -> List[int]:
+        """Indexes of the sources matching the current filter, in registry order."""
+        if not self.query:
+            return list(range(len(self.sources)))
+        needle = self.query.lower()
+        matched = []
+        for index, source in enumerate(self.sources):
+            haystack = " ".join((source.name, source.provider, source.binary,
+                                 source.description)).lower()
+            if needle in haystack:
+                matched.append(index)
+        return matched
+
+    def result(self) -> List[str]:
+        """The chosen source names, in registry order."""
+        return [source.name for source in self.sources if source.name in self.selected]
+
+    def handle_key(self, key: str) -> Optional[str]:
+        """Apply one keypress. Returns "accept", "cancel", or None to continue."""
+        if self.filtering:
+            return self._handle_filter_key(key)
+
+        visible = self.visible()
+        self.status = ""
+
+        if key in ("up", "k"):
+            self._move(-1, visible)
+        elif key in ("down", "j"):
+            self._move(1, visible)
+        elif key == "pgup":
+            self._move(-10, visible)
+        elif key == "pgdn":
+            self._move(10, visible)
+        elif key in ("home", "g"):
+            self.cursor = 0
+        elif key in ("end", "G"):
+            self.cursor = max(0, len(visible) - 1)
+        elif key in (" ", "x") and visible:
+            name = self.sources[visible[min(self.cursor, len(visible) - 1)]].name
+            self.selected.symmetric_difference_update({name})
+            self._move(1, visible)
+        elif key == "a":
+            names = {self.sources[index].name for index in visible}
+            self.selected |= names
+            self.status = "selected %d source(s)" % len(names)
+        elif key == "n":
+            names = {self.sources[index].name for index in visible}
+            self.selected -= names
+            self.status = "cleared %d source(s)" % len(names)
+        elif key == "d":
+            self.selected = {source.name for source in self.sources if source.default}
+            self.status = "reset to the default sources"
+        elif key == "r":
+            names = {self.sources[index].name for index in visible
+                     if not self.reasons.get(self.sources[index].name)}
+            self.selected |= names
+            self.status = "added %d source(s) ready to run here" % len(names)
+        elif key == "/":
+            self.filtering = True
+        elif key == "enter":
+            return "accept"
+        elif key == "esc" and self.query:
+            # A filter is still narrowing the list: clear it rather than
+            # quitting, which is what escape means with a filter on screen.
+            self.query = ""
+            self.cursor = 0
+            self.offset = 0
+        elif key in ("q", "esc", "ctrl-c", "eof"):
+            return "cancel"
+        return None
+
+    def _handle_filter_key(self, key: str) -> Optional[str]:
+        if key == "enter":
+            self.filtering = False
+        elif key in ("esc", "ctrl-c"):
+            self.filtering = False
+            self.query = ""
+        elif key == "backspace":
+            self.query = self.query[:-1]
+        elif key == "clear":
+            self.query = ""
+        elif key == "eof":
+            return "cancel"
+        elif len(key) == 1 and key.isprintable():
+            self.query += key
+        self.cursor = 0
+        self.offset = 0
+        return None
+
+    def _move(self, delta: int, visible: Sequence[int]) -> None:
+        if not visible:
+            self.cursor = 0
+            return
+        self.cursor = max(0, min(self.cursor + delta, len(visible) - 1))
+
+    def _scroll(self, rows: int, total: int) -> None:
+        if self.cursor < self.offset:
+            self.offset = self.cursor
+        elif self.cursor >= self.offset + rows:
+            self.offset = self.cursor - rows + 1
+        self.offset = max(0, min(self.offset, max(0, total - rows)))
+
+    # -- view -------------------------------------------------------------
+
+    def _paint(self, text: str, code: str) -> str:
+        return "\033[%sm%s\033[0m" % (code, text) if self.color else text
+
+    def render(self, width: int = 80, height: int = 24) -> List[str]:
+        """Draw the list. Escape codes are applied per row, after truncation."""
+        visible = self.visible()
+        self.cursor = min(self.cursor, max(0, len(visible) - 1))
+        rows = max(1, height - 5)   # two header lines, three at the foot
+        self._scroll(rows, len(visible))
+
+        ready = len([name for name in self.selected if not self.reasons.get(name)])
+        title = "  sub-passive · select sources"
+        tally = "%d selected · %d ready here  " % (len(self.selected), ready)
+        gap = max(1, width - len(title) - len(tally))
+        lines = [self._paint((title + " " * gap + tally)[:width], "1"), ""]
+
+        for slot in range(rows):
+            index = self.offset + slot
+            if index >= len(visible):
+                lines.append("")
+                continue
+            source = self.sources[visible[index]]
+            reason = self.reasons.get(source.name, "")
+            notes = source.description
+            if not source.default:
+                notes += "  [off by default]"
+            if reason:
+                notes += "  (%s)" % reason
+            row = ("%s %s %-16s %-15s %-7s %s" % (
+                ">" if index == self.cursor else " ",
+                "[x]" if source.name in self.selected else "[ ]",
+                source.name,
+                source.provider or ("binary" if source.binary else "none"),
+                "skip" if reason else "ready",
+                notes,
+            ))[:width]
+            if index == self.cursor:
+                lines.append(self._paint(row.ljust(min(width, 100)), "7"))
+            elif reason:
+                lines.append(self._paint(row, "2"))
+            else:
+                lines.append(row)
+
+        lines.append("")
+        if self.filtering or self.query:
+            footer = "  /%s%s" % (self.query, "_" if self.filtering else "")
+            if not visible:
+                footer += "   no source matches"
+        else:
+            footer = "  " + self.status
+        lines.append(self._paint(footer[:width], "36"))
+        lines.append(self._paint(("  " + self.HELP)[:width], "2"))
+        # A frame taller than the terminal would scroll the screen, so on a
+        # very short one the help line is what gets cut.
+        return lines[:height] if height > 0 else lines
+
+
+def run_picker(picker: SourcePicker) -> Optional[List[str]]:
+    """Drive the picker full-screen on /dev/tty.
+
+    Returns the chosen names, or None if the user quit. Raises NoTerminal when
+    this terminal cannot be driven, which is the caller's cue to fall back to
+    the numbered prompt.
+    """
+    try:
+        import termios
+        import tty
+    except ImportError:  # no POSIX terminal control (Windows)
+        raise NoTerminal("no terminal control available")
+
+    if os.environ.get("TERM", "") in ("", "dumb"):
+        raise NoTerminal("TERM is not set to a usable terminal")
+
+    try:
+        stream_in = open("/dev/tty", "rb", buffering=0)
+    except OSError as exc:
+        raise NoTerminal("cannot open /dev/tty: %s" % exc)
+    try:
+        stream_out = open("/dev/tty", "w")
+    except OSError as exc:
+        stream_in.close()
+        raise NoTerminal("cannot open /dev/tty: %s" % exc)
+
+    fd = stream_in.fileno()
+    try:
+        saved = termios.tcgetattr(fd)
+    except termios.error as exc:
+        stream_in.close()
+        stream_out.close()
+        raise NoTerminal("cannot read terminal settings: %s" % exc)
+
+    picker.color = not os.environ.get("NO_COLOR")
+    try:
+        tty.setraw(fd)
+        stream_out.write("\033[?1049h\033[?25l")   # alternate screen, hide cursor
+        while True:
+            size = shutil.get_terminal_size((80, 24))
+            frame = picker.render(size.columns, size.lines)
+            stream_out.write("\033[H\033[2J" + "\r\n".join(frame))
+            stream_out.flush()
+            action = picker.handle_key(read_key(stream_in))
+            if action == "accept":
+                return picker.result()
+            if action == "cancel":
+                return None
+    finally:
+        termios.tcsetattr(fd, termios.TCSADRAIN, saved)
+        stream_out.write("\033[?25h\033[?1049l")   # restore cursor and screen
+        stream_out.flush()
+        stream_in.close()
+        stream_out.close()
+
+
+def toggle_numbers(picker: SourcePicker, text: str) -> List[str]:
+    """Toggle sources named by "3" or "5-8" tokens. Returns the bad tokens."""
+    bad = []
+    for token in text.replace(",", " ").split():
+        bounds = token.split("-", 1) if "-" in token[1:] else [token, token]
+        try:
+            first, last = int(bounds[0]), int(bounds[1])
+        except ValueError:
+            bad.append(token)
+            continue
+        if first > last or first < 1 or last > len(picker.sources):
+            bad.append(token)
+            continue
+        for number in range(first, last + 1):
+            name = picker.sources[number - 1].name
+            picker.selected.symmetric_difference_update({name})
+    return bad
+
+
+def prompt_picker(picker: SourcePicker, read_line: Callable[[], Optional[str]],
+                  write: Callable[[str], None]) -> Optional[List[str]]:
+    """Numbered fallback for terminals run_picker() cannot drive."""
+    while True:
+        write("\n%-4s %-3s %-16s %-15s %-7s %s\n"
+              % ("#", "ON", "SOURCE", "AUTH", "STATUS", "NOTES"))
+        for number, source in enumerate(picker.sources, 1):
+            reason = picker.reasons.get(source.name, "")
+            notes = source.description
+            if reason:
+                notes += "  (%s)" % reason
+            write("%-4d %-3s %-16s %-15s %-7s %s\n" % (
+                number,
+                "[x]" if source.name in picker.selected else "[ ]",
+                source.name,
+                source.provider or ("binary" if source.binary else "none"),
+                "skip" if reason else "ready",
+                notes,
+            ))
+        write("\nToggle by number (3, or 5-8) · a all · n none · d defaults · "
+              "r ready · q quit\nEnter runs the %d selected source(s) > "
+              % len(picker.selected))
+
+        line = read_line()
+        if line is None:
+            return None
+        command = line.strip()
+        if not command:
+            return picker.result()
+        if command.lower() in ("q", "quit"):
+            return None
+        if command.lower() in ("a", "n", "d", "r"):
+            picker.handle_key(command.lower())
+            continue
+        bad = toggle_numbers(picker, command)
+        if bad:
+            write("[!] Not a source number: %s\n" % " ".join(bad))
+
+
+def choose_sources(preset: Sequence[str]) -> Optional[List[str]]:
+    """Ask the user which sources to run, starting from the preset selection.
+
+    Returns the chosen names, or None if the user quit. Raises NoTerminal when
+    there is no terminal to ask on at all.
+    """
+    picker = SourcePicker(SOURCES, preset)
+    try:
+        return run_picker(picker)
+    except NoTerminal:
+        pass
+
+    handle = None
+    try:
+        handle = open("/dev/tty", "r+")
+        reader, writer = handle, handle
+    except OSError:
+        if not sys.stdin.isatty():
+            raise NoTerminal("no terminal to read a selection from")
+        reader, writer = sys.stdin, sys.stderr
+
+    def read_line() -> Optional[str]:
+        line = reader.readline()
+        return None if line == "" else line
+
+    def write(text: str) -> None:
+        writer.write(text)
+        writer.flush()
+
+    try:
+        return prompt_picker(picker, read_line, write)
+    finally:
+        if handle is not None:
+            handle.close()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Passive Subdomain Scanner",
@@ -1146,6 +1569,8 @@ def parse_args() -> argparse.Namespace:
         help="Sources to skip"
     )
 
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="Pick sources from a checkbox list before scanning")
     parser.add_argument("--all", action="store_true",
                         help="Also query slow and unreliable sources")
     parser.add_argument("--list-sources", action="store_true",
@@ -1196,6 +1621,24 @@ def main() -> None:
     if not domains:
         log("[!] No target domain given")
         sys.exit(1)
+
+    if args.interactive:
+        preset = [source.name for source in
+                  select_sources(args.tools, args.all, args.exclude)]
+        try:
+            chosen = choose_sources(preset)
+        except NoTerminal as exc:
+            log("[!] --interactive needs a terminal (%s)" % exc)
+            sys.exit(1)
+        if chosen is None:
+            log("[!] Cancelled")
+            sys.exit(130)
+        if not chosen:
+            log("[!] No sources selected")
+            sys.exit(1)
+        # The picker's answer is the whole selection, so --all and --exclude
+        # have already been folded into it.
+        args.tools, args.exclude = chosen, None
 
     known = load_known(args.known) if args.known else set()
     if args.only_new and not known:
