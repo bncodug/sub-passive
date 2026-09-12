@@ -197,6 +197,83 @@ class TestReadBody(unittest.TestCase):
             sp._read_body(self.FakeResponse(b"not actually gzip", "gzip"))
 
 
+class TestErrorDetail(unittest.TestCase):
+    """A failing request is logged, so its body has to be decoded first.
+
+    The request asks for gzip, and servers compress error pages too: read raw,
+    a 404 page reaches the terminal as mojibake.
+    """
+
+    def _error(self, body, encoding=None, code=404):
+        headers = {"Content-Encoding": encoding} if encoding else {}
+        return urllib.error.HTTPError("https://example.invalid/", code,
+                                      "Not Found", headers, io.BytesIO(body))
+
+    PAGE = b"<html><title>404 Not Found</title>\nnginx is busy\n</html>"
+
+    def test_plain_body(self):
+        self.assertIn("404 Not Found", sp._error_detail(self._error(self.PAGE)))
+
+    def test_gzip_body_is_decompressed(self):
+        import gzip
+        detail = sp._error_detail(self._error(gzip.compress(self.PAGE), "gzip"))
+        self.assertIn("404 Not Found", detail)
+        self.assertNotIn("\ufffd", detail)
+
+    def test_deflate_body_is_decompressed(self):
+        import zlib
+        detail = sp._error_detail(self._error(zlib.compress(self.PAGE), "deflate"))
+        self.assertIn("404 Not Found", detail)
+
+    def test_a_truncated_stream_still_yields_its_start(self):
+        import gzip
+        # Only the first few KB are read, so the stream never ends cleanly.
+        body = gzip.compress(b"rate limited: " + b"x" * 200000)
+        self.assertTrue(sp._error_detail(self._error(body, "gzip"))
+                        .startswith("rate limited:"))
+
+    def test_an_encoding_we_cannot_undo_is_described(self):
+        detail = sp._error_detail(self._error(b"\x1b\x0e\x00\x8c\x2a\xce", "br"))
+        self.assertEqual(detail, "<6 bytes of unreadable br body>")
+
+    def test_a_binary_body_is_described(self):
+        detail = sp._error_detail(self._error(bytes(range(128, 250))))
+        self.assertIn("unreadable", detail)
+
+    def test_an_empty_body(self):
+        self.assertEqual(sp._error_detail(self._error(b"")), "")
+
+    def test_http_get_reports_a_readable_message(self):
+        import gzip
+        body = gzip.compress(b"Rate limit exceeded")
+
+        def fake_urlopen(request, timeout=None):
+            raise self._error(body, "gzip", code=404)
+
+        with mock.patch.object(sp.urllib.request, "urlopen", fake_urlopen):
+            with self.assertRaises(sp.SourceError) as caught:
+                sp.http_get("https://example.invalid", retries=0)
+        self.assertEqual(str(caught.exception), "http 404: Rate limit exceeded")
+
+
+class TestReadable(unittest.TestCase):
+    """Error text comes from the far end and is printed to a terminal."""
+
+    def test_escape_sequences_are_stripped(self):
+        self.assertEqual(sp._readable("\x1b[2J\x1b]0;title\x07gone"),
+                         "[2J ]0;title gone")
+
+    def test_collapsed_onto_one_line(self):
+        self.assertEqual(sp._readable("a\n\n  b\tc\r\n"), "a b c")
+
+    def test_truncated(self):
+        self.assertEqual(len(sp._readable("x" * 500)), 200)
+        self.assertEqual(sp._readable("x" * 500, 20), "x" * 20)
+
+    def test_text_is_otherwise_left_alone(self):
+        self.assertEqual(sp._readable("http 429: slow down"), "http 429: slow down")
+
+
 class TestTimeoutResolution(unittest.TestCase):
     """--timeout has to reach the sources that set their own longer values."""
 

@@ -213,6 +213,59 @@ def _read_body(response) -> str:
     return raw.decode("utf-8", "replace")
 
 
+_UNPRINTABLE = re.compile(r"[^\x20-\x7e\xa0-\uffff]")
+
+
+def _readable(text: str, limit: int = 200) -> str:
+    """Fold server-supplied text into one short line that is safe to print.
+
+    Error bodies are written by whatever is on the other end and land on a
+    terminal, so control characters - escape sequences above all - are dropped
+    rather than passed through.
+    """
+    return " ".join(_UNPRINTABLE.sub(" ", text).split())[:limit].strip()
+
+
+def _inflate_partial(raw: bytes, encoding: str) -> bytes:
+    """Best-effort decompress of a body that was only read as far as needed."""
+    wbits = 16 + zlib.MAX_WBITS if encoding in ("gzip", "x-gzip") else zlib.MAX_WBITS
+    for bits in (wbits, -zlib.MAX_WBITS):
+        try:
+            # An incremental decompressor, because the tail of the stream is
+            # deliberately missing: it returns what it has instead of raising.
+            return zlib.decompressobj(bits).decompress(raw)
+        except zlib.error:
+            continue
+    return raw
+
+
+def _error_detail(exc) -> str:
+    """Summarize an error response body for a log line.
+
+    The body arrives under whatever Content-Encoding was negotiated, and this
+    request asked for gzip, so reading it raw is how a 404 page ends up on
+    screen as mojibake. Anything still unreadable after decompressing - brotli,
+    say, or an actually binary body - is described rather than printed.
+    """
+    try:
+        raw = exc.read(4096)
+    except Exception:   # the body is best effort only
+        return ""
+    if not raw:
+        return ""
+
+    headers = getattr(exc, "headers", None)
+    encoding = ""
+    if headers:
+        encoding = (headers.get("Content-Encoding") or "").lower().strip()
+    body = _inflate_partial(raw, encoding) if encoding else raw
+
+    text = _readable(body.decode("utf-8", "replace"))
+    if not text or text.count("\ufffd") * 4 > len(text):
+        return "<%d bytes of unreadable %s body>" % (len(raw), encoding or "response")
+    return text
+
+
 def http_get(
     url: str,
     headers: Optional[Dict[str, str]] = None,
@@ -247,12 +300,9 @@ def http_get(
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return _read_body(response)
         except urllib.error.HTTPError as exc:
-            detail = ""
-            try:
-                detail = exc.read(300).decode("utf-8", "replace").strip()
-            except Exception:  # the body is best effort only
-                pass
-            last_error = SourceError("http %d: %s" % (exc.code, " ".join(detail.split())))
+            detail = _error_detail(exc)
+            last_error = SourceError("http %d: %s" % (exc.code, detail)
+                                     if detail else "http %d" % exc.code)
             if exc.code == 429:
                 # Honour Retry-After, but never sleep on a request we have
                 # already decided not to repeat.
@@ -846,7 +896,7 @@ def run_sources(domain: str, sources: Sequence[Source], threads: int,
             if failure is not None:
                 # SourceError carries a message written for a human; anything
                 # else is a bug in a source and is shown as a repr.
-                detail = (str(failure) if isinstance(failure, SourceError)
+                detail = (_readable(str(failure)) if isinstance(failure, SourceError)
                           else repr(failure))
                 stats.append(Stat(source.name, 0, 0, elapsed, error=detail))
                 progress("  %s %-16s %s" % (paint("x", "31"), source.name,
