@@ -519,6 +519,13 @@ class TestExternalTools(unittest.TestCase):
             self.assertEqual(sp.waymore("example.com"),
                              ["a.example.com", "b.example.com"])
 
+    def test_waymore_streams_to_stdout_instead_of_a_results_file(self):
+        with mock.patch.object(sp, "run_command", return_value=[]) as run:
+            sp.waymore("example.com")
+        command = run.call_args[0][0]
+        self.assertEqual(command[:3], ["waymore", "-i", "example.com"])
+        self.assertIn("--stream", command)
+
     def test_run_tool_reads_amass_record_output(self):
         """amass prints "host (FQDN) --> record --> value", not bare names."""
         with mock.patch.object(

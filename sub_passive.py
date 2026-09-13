@@ -668,7 +668,10 @@ def assetfinder(domain: str) -> List[str]:
 
 
 def waymore(domain: str) -> List[str]:
-    return run_tool(["waymore", "-i", domain, "-mode", "U"], domain)
+    # --stream prints URLs to stdout and skips the results file waymore would
+    # otherwise append to under ~/.config/waymore on every run. Duplicates in
+    # the stream are removed downstream.
+    return run_tool(["waymore", "-i", domain, "-mode", "U", "--stream"], domain)
 
 
 def amass(domain: str) -> List[str]:
