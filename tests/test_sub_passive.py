@@ -197,6 +197,83 @@ class TestReadBody(unittest.TestCase):
             sp._read_body(self.FakeResponse(b"not actually gzip", "gzip"))
 
 
+class TestErrorDetail(unittest.TestCase):
+    """A failing request is logged, so its body has to be decoded first.
+
+    The request asks for gzip, and servers compress error pages too: read raw,
+    a 404 page reaches the terminal as mojibake.
+    """
+
+    def _error(self, body, encoding=None, code=404):
+        headers = {"Content-Encoding": encoding} if encoding else {}
+        return urllib.error.HTTPError("https://example.invalid/", code,
+                                      "Not Found", headers, io.BytesIO(body))
+
+    PAGE = b"<html><title>404 Not Found</title>\nnginx is busy\n</html>"
+
+    def test_plain_body(self):
+        self.assertIn("404 Not Found", sp._error_detail(self._error(self.PAGE)))
+
+    def test_gzip_body_is_decompressed(self):
+        import gzip
+        detail = sp._error_detail(self._error(gzip.compress(self.PAGE), "gzip"))
+        self.assertIn("404 Not Found", detail)
+        self.assertNotIn("\ufffd", detail)
+
+    def test_deflate_body_is_decompressed(self):
+        import zlib
+        detail = sp._error_detail(self._error(zlib.compress(self.PAGE), "deflate"))
+        self.assertIn("404 Not Found", detail)
+
+    def test_a_truncated_stream_still_yields_its_start(self):
+        import gzip
+        # Only the first few KB are read, so the stream never ends cleanly.
+        body = gzip.compress(b"rate limited: " + b"x" * 200000)
+        self.assertTrue(sp._error_detail(self._error(body, "gzip"))
+                        .startswith("rate limited:"))
+
+    def test_an_encoding_we_cannot_undo_is_described(self):
+        detail = sp._error_detail(self._error(b"\x1b\x0e\x00\x8c\x2a\xce", "br"))
+        self.assertEqual(detail, "<6 bytes of unreadable br body>")
+
+    def test_a_binary_body_is_described(self):
+        detail = sp._error_detail(self._error(bytes(range(128, 250))))
+        self.assertIn("unreadable", detail)
+
+    def test_an_empty_body(self):
+        self.assertEqual(sp._error_detail(self._error(b"")), "")
+
+    def test_http_get_reports_a_readable_message(self):
+        import gzip
+        body = gzip.compress(b"Rate limit exceeded")
+
+        def fake_urlopen(request, timeout=None):
+            raise self._error(body, "gzip", code=404)
+
+        with mock.patch.object(sp.urllib.request, "urlopen", fake_urlopen):
+            with self.assertRaises(sp.SourceError) as caught:
+                sp.http_get("https://example.invalid", retries=0)
+        self.assertEqual(str(caught.exception), "http 404: Rate limit exceeded")
+
+
+class TestReadable(unittest.TestCase):
+    """Error text comes from the far end and is printed to a terminal."""
+
+    def test_escape_sequences_are_stripped(self):
+        self.assertEqual(sp._readable("\x1b[2J\x1b]0;title\x07gone"),
+                         "[2J ]0;title gone")
+
+    def test_collapsed_onto_one_line(self):
+        self.assertEqual(sp._readable("a\n\n  b\tc\r\n"), "a b c")
+
+    def test_truncated(self):
+        self.assertEqual(len(sp._readable("x" * 500)), 200)
+        self.assertEqual(sp._readable("x" * 500, 20), "x" * 20)
+
+    def test_text_is_otherwise_left_alone(self):
+        self.assertEqual(sp._readable("http 429: slow down"), "http 429: slow down")
+
+
 class TestTimeoutResolution(unittest.TestCase):
     """--timeout has to reach the sources that set their own longer values."""
 
@@ -441,6 +518,13 @@ class TestExternalTools(unittest.TestCase):
                               "https://b.example.com/y"]):
             self.assertEqual(sp.waymore("example.com"),
                              ["a.example.com", "b.example.com"])
+
+    def test_waymore_streams_to_stdout_instead_of_a_results_file(self):
+        with mock.patch.object(sp, "run_command", return_value=[]) as run:
+            sp.waymore("example.com")
+        command = run.call_args[0][0]
+        self.assertEqual(command[:3], ["waymore", "-i", "example.com"])
+        self.assertIn("--stream", command)
 
     def test_run_tool_reads_amass_record_output(self):
         """amass prints "host (FQDN) --> record --> value", not bare names."""
@@ -871,6 +955,214 @@ class TestCli(unittest.TestCase):
         printed = out.getvalue()
         for name in ("crtsh", "subfinder", "SOURCE"):
             self.assertIn(name, printed)
+
+
+class TestSourcePicker(unittest.TestCase):
+    """The interactive picker, driven by keys instead of a terminal."""
+
+    def _picker(self, selected=("crtsh",)):
+        sources = [
+            sp.Source("crtsh", lambda d: [], "certificate transparency logs"),
+            sp.Source("wayback", lambda d: [], "Wayback Machine CDX index"),
+            sp.Source("commoncrawl", lambda d: [], "Common Crawl index",
+                      default=False),
+            sp.Source("virustotal", lambda d: [], "VirusTotal",
+                      provider="virustotal"),
+            sp.Source("subfinder", lambda d: [], "subfinder, if installed",
+                      binary="subfinder"),
+        ]
+        reasons = {"crtsh": "", "wayback": "", "commoncrawl": "",
+                   "virustotal": "no SUB_PASSIVE_VIRUSTOTAL_KEY",
+                   "subfinder": "not installed"}
+        return sp.SourcePicker(sources, selected, reasons=reasons)
+
+    def test_space_toggles_and_advances(self):
+        picker = self._picker()
+        picker.handle_key(" ")                  # crtsh off
+        self.assertEqual(picker.result(), [])
+        self.assertEqual(picker.cursor, 1)
+        picker.handle_key(" ")                  # wayback on
+        self.assertEqual(picker.result(), ["wayback"])
+
+    def test_result_keeps_registry_order(self):
+        picker = self._picker(selected=["subfinder", "crtsh", "wayback"])
+        self.assertEqual(picker.result(), ["crtsh", "wayback", "subfinder"])
+
+    def test_select_all_and_none(self):
+        picker = self._picker()
+        picker.handle_key("a")
+        self.assertEqual(len(picker.result()), 5)
+        picker.handle_key("n")
+        self.assertEqual(picker.result(), [])
+
+    def test_defaults_and_ready(self):
+        picker = self._picker(selected=[])
+        picker.handle_key("d")
+        self.assertEqual(picker.result(),
+                         ["crtsh", "wayback", "virustotal", "subfinder"])
+        picker.handle_key("n")
+        picker.handle_key("r")
+        # Sources with a skip reason are not runnable here, so "r" leaves them.
+        self.assertEqual(picker.result(), ["crtsh", "wayback", "commoncrawl"])
+
+    def test_filter_matches_name_and_description(self):
+        picker = self._picker()
+        for key in ("/", "c", "r", "a", "w", "l"):
+            picker.handle_key(key)
+        self.assertEqual([picker.sources[i].name for i in picker.visible()],
+                         ["commoncrawl"])
+        picker.handle_key("backspace")          # "craw" still matches
+        self.assertEqual(len(picker.visible()), 1)
+        picker.handle_key("enter")              # leave the filter in place
+        self.assertFalse(picker.filtering)
+        picker.handle_key(" ")
+        self.assertIn("commoncrawl", picker.result())
+
+    def test_escape_clears_the_filter_without_quitting(self):
+        picker = self._picker()
+        for key in ("/", "z", "z"):
+            picker.handle_key(key)
+        self.assertEqual(picker.visible(), [])
+        self.assertIsNone(picker.handle_key("esc"))
+        self.assertEqual(picker.query, "")
+        self.assertEqual(len(picker.visible()), 5)
+
+    def test_escape_clears_an_applied_filter_before_quitting(self):
+        picker = self._picker()
+        for key in ("/", "c", "r", "a", "w", "l", "enter"):
+            picker.handle_key(key)
+        self.assertIsNone(picker.handle_key("esc"))     # clears the filter
+        self.assertEqual(picker.query, "")
+        self.assertEqual(picker.handle_key("esc"), "cancel")
+
+    def test_toggle_is_ignored_when_nothing_matches(self):
+        picker = self._picker()
+        for key in ("/", "z", "enter", " "):
+            picker.handle_key(key)
+        self.assertEqual(picker.result(), ["crtsh"])
+
+    def test_cursor_stays_inside_the_list(self):
+        picker = self._picker()
+        for _ in range(20):
+            picker.handle_key("down")
+        self.assertEqual(picker.cursor, 4)
+        for _ in range(20):
+            picker.handle_key("up")
+        self.assertEqual(picker.cursor, 0)
+
+    def test_enter_accepts_and_q_cancels(self):
+        picker = self._picker()
+        self.assertEqual(picker.handle_key("enter"), "accept")
+        self.assertEqual(picker.handle_key("q"), "cancel")
+        self.assertEqual(picker.handle_key("esc"), "cancel")
+        self.assertEqual(picker.handle_key("eof"), "cancel")
+
+    def test_render_fits_the_terminal(self):
+        picker = self._picker()
+        lines = picker.render(40, 12)
+        self.assertEqual(len(lines), 12)
+        for line in lines:
+            self.assertLessEqual(len(line), 40)
+
+    def test_render_scrolls_to_follow_the_cursor(self):
+        picker = self._picker()
+        rows = lambda: [ln for ln in picker.render(80, 9) if "[" in ln]  # noqa: E731
+        self.assertIn("crtsh", " ".join(rows()))
+        for _ in range(4):
+            picker.handle_key("down")
+        visible = " ".join(rows())
+        self.assertIn("subfinder", visible)
+        self.assertNotIn("crtsh", visible)
+
+    def test_render_marks_selection_and_skips(self):
+        picker = self._picker()
+        text = "\n".join(picker.render(120, 12))
+        self.assertIn("[x] crtsh", text)
+        self.assertIn("[ ] wayback", text)
+        self.assertIn("no SUB_PASSIVE_VIRUSTOTAL_KEY", text)
+
+
+class TestReadKey(unittest.TestCase):
+    def _key(self, data):
+        return sp.read_key(io.BytesIO(data))
+
+    def test_named_keys(self):
+        self.assertEqual(self._key(b"\x1b[A"), "up")
+        self.assertEqual(self._key(b"\x1bOB"), "down")
+        self.assertEqual(self._key(b"\x1b[5~"), "pgup")
+        self.assertEqual(self._key(b"\r"), "enter")
+        self.assertEqual(self._key(b"\x7f"), "backspace")
+        self.assertEqual(self._key(b"\x03"), "ctrl-c")
+
+    def test_bare_escape_is_not_an_arrow_key(self):
+        self.assertEqual(sp.read_key(io.BytesIO(b"\x1b"),
+                                     waiter=lambda stream, timeout: False), "esc")
+
+    def test_printable_characters_come_back_as_themselves(self):
+        self.assertEqual(self._key(b" "), " ")
+        self.assertEqual(self._key(b"q"), "q")
+        self.assertEqual(self._key("é".encode("utf-8")), "é")
+
+    def test_end_of_input(self):
+        self.assertEqual(self._key(b""), "eof")
+
+
+class TestPromptPicker(unittest.TestCase):
+    """The numbered fallback used when the full-screen picker cannot run."""
+
+    def _picker(self):
+        picker = sp.SourcePicker(sp.SOURCES, ["crtsh"])
+        picker.reasons = {source.name: "" for source in sp.SOURCES}
+        return picker
+
+    def _run(self, answers):
+        picker = self._picker()
+        replies = iter(answers)
+        out = io.StringIO()
+        result = sp.prompt_picker(picker, lambda: next(replies, None), out.write)
+        return result, out.getvalue()
+
+    def test_numbers_and_ranges_toggle(self):
+        result, _ = self._run(["1\n", "2-3\n", "\n"])
+        self.assertEqual(result, ["certspotter", "hackertarget"])
+
+    def test_word_commands(self):
+        result, _ = self._run(["n\n", "d\n", "\n"])
+        self.assertEqual(result, [s.name for s in sp.SOURCES if s.default])
+
+    def test_quit_returns_nothing(self):
+        result, _ = self._run(["q\n"])
+        self.assertIsNone(result)
+
+    def test_end_of_input_returns_nothing(self):
+        result, _ = self._run([])
+        self.assertIsNone(result)
+
+    def test_a_bad_token_is_reported_and_changes_nothing(self):
+        result, printed = self._run(["99\n", "\n"])
+        self.assertIn("Not a source number: 99", printed)
+        self.assertEqual(result, ["crtsh"])
+
+
+class TestChooseSources(unittest.TestCase):
+    def test_falls_back_to_the_prompt_without_a_terminal(self):
+        def no_terminal(picker):
+            raise sp.NoTerminal("no terminal")
+
+        opened = mock.mock_open(read_data="q\n")
+        with mock.patch.object(sp, "run_picker", no_terminal):
+            with mock.patch("builtins.open", opened):
+                self.assertIsNone(sp.choose_sources(["crtsh"]))
+
+    def test_raises_when_there_is_no_terminal_at_all(self):
+        def no_terminal(picker):
+            raise sp.NoTerminal("no terminal")
+
+        with mock.patch.object(sp, "run_picker", no_terminal):
+            with mock.patch("builtins.open", side_effect=OSError("no /dev/tty")):
+                with mock.patch.object(sys.stdin, "isatty", return_value=False):
+                    with self.assertRaises(sp.NoTerminal):
+                        sp.choose_sources(["crtsh"])
 
 
 if __name__ == "__main__":
